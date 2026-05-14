@@ -135,8 +135,8 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/renameData", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
-            renameDataAtAddress(params.get("address"), params.get("newName"));
-            sendResponse(exchange, "Rename data attempted");
+            boolean success = renameDataAtAddress(params.get("address"), params.get("newName"));
+            sendResponse(exchange, success ? "Renamed successfully" : "Rename failed");
         });
 
         server.createContext("/renameVariable", exchange -> {
@@ -540,38 +540,38 @@ public class GhidraMCPPlugin extends Plugin {
         return successFlag.get();
     }
 
-    private void renameDataAtAddress(String addressStr, String newName) {
+    private boolean renameDataAtAddress(String addressStr, String newName) {
         Program program = getCurrentProgram();
-        if (program == null) return;
+        if (program == null) return false;
+        if (addressStr == null || addressStr.isEmpty() || newName == null || newName.isEmpty()) return false;
 
+        AtomicBoolean successFlag = new AtomicBoolean(false);
         try {
             SwingUtilities.invokeAndWait(() -> {
                 int tx = program.startTransaction("Rename data");
                 try {
                     Address addr = program.getAddressFactory().getAddress(addressStr);
-                    Listing listing = program.getListing();
-                    Data data = listing.getDefinedDataAt(addr);
-                    if (data != null) {
-                        SymbolTable symTable = program.getSymbolTable();
-                        Symbol symbol = symTable.getPrimarySymbol(addr);
-                        if (symbol != null) {
-                            symbol.setName(newName, SourceType.USER_DEFINED);
-                        } else {
-                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
-                        }
+                    SymbolTable symTable = program.getSymbolTable();
+                    Symbol symbol = symTable.getPrimarySymbol(addr);
+                    if (symbol != null) {
+                        symbol.setName(newName, SourceType.USER_DEFINED);
+                    } else {
+                        symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
                     }
+                    successFlag.set(true);
                 }
                 catch (Exception e) {
                     Msg.error(this, "Rename data error", e);
                 }
                 finally {
-                    program.endTransaction(tx, true);
+                    program.endTransaction(tx, successFlag.get());
                 }
             });
         }
         catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute rename data on Swing thread", e);
         }
+        return successFlag.get();
     }
 
     private String renameVariableInFunction(String functionName, String oldVarName, String newVarName) {
@@ -639,6 +639,9 @@ public class GhidraMCPPlugin extends Plugin {
                     if (commitRequired) {
                         HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
                             ReturnCommitOption.NO_COMMIT, finalFunction.getSignatureSource());
+                    } else {
+                        HighFunctionDBUtil.commitLocalNamesToDatabase(highFunction,
+                            finalFunction.getSignatureSource());
                     }
                     HighFunctionDBUtil.updateDBVariable(
                         finalHighSymbol,
@@ -1275,7 +1278,8 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Get all references from a specific address (xref from)
+     * Get all references from a specific address or function (xref from).
+     * If the address is a function entry point, iterates the entire function body.
      */
     private String getXrefsFrom(String addressStr, int offset, int limit) {
         Program program = getCurrentProgram();
@@ -1285,28 +1289,47 @@ public class GhidraMCPPlugin extends Plugin {
         try {
             Address addr = program.getAddressFactory().getAddress(addressStr);
             ReferenceManager refManager = program.getReferenceManager();
-            
-            Reference[] references = refManager.getReferencesFrom(addr);
-            
             List<String> refs = new ArrayList<>();
-            for (Reference ref : references) {
-                Address toAddr = ref.getToAddress();
-                RefType refType = ref.getReferenceType();
-                
-                String targetInfo = "";
-                Function toFunc = program.getFunctionManager().getFunctionAt(toAddr);
-                if (toFunc != null) {
-                    targetInfo = " to function " + toFunc.getName();
-                } else {
-                    Data data = program.getListing().getDataAt(toAddr);
-                    if (data != null) {
-                        targetInfo = " to data " + (data.getLabel() != null ? data.getLabel() : data.getPathName());
+
+            Function func = program.getFunctionManager().getFunctionAt(addr);
+            if (func != null) {
+                InstructionIterator instructions = program.getListing().getInstructions(func.getBody(), true);
+                while (instructions.hasNext()) {
+                    Instruction instr = instructions.next();
+                    for (Reference ref : refManager.getReferencesFrom(instr.getAddress())) {
+                        Address toAddr = ref.getToAddress();
+                        RefType refType = ref.getReferenceType();
+                        String targetInfo = "";
+                        Function toFunc = program.getFunctionManager().getFunctionAt(toAddr);
+                        if (toFunc != null) {
+                            targetInfo = " to function " + toFunc.getName();
+                        } else {
+                            Data data = program.getListing().getDataAt(toAddr);
+                            if (data != null) {
+                                targetInfo = " to data " + (data.getLabel() != null ? data.getLabel() : data.getPathName());
+                            }
+                        }
+                        refs.add(String.format("From %s to %s%s [%s]", instr.getAddress(), toAddr, targetInfo, refType.getName()));
                     }
                 }
-                
-                refs.add(String.format("To %s%s [%s]", toAddr, targetInfo, refType.getName()));
+            } else {
+                for (Reference ref : refManager.getReferencesFrom(addr)) {
+                    Address toAddr = ref.getToAddress();
+                    RefType refType = ref.getReferenceType();
+                    String targetInfo = "";
+                    Function toFunc = program.getFunctionManager().getFunctionAt(toAddr);
+                    if (toFunc != null) {
+                        targetInfo = " to function " + toFunc.getName();
+                    } else {
+                        Data data = program.getListing().getDataAt(toAddr);
+                        if (data != null) {
+                            targetInfo = " to data " + (data.getLabel() != null ? data.getLabel() : data.getPathName());
+                        }
+                    }
+                    refs.add(String.format("To %s%s [%s]", toAddr, targetInfo, refType.getName()));
+                }
             }
-            
+
             return paginateList(refs, offset, limit);
         } catch (Exception e) {
             return "Error getting references from address: " + e.getMessage();

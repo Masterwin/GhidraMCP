@@ -23,7 +23,7 @@ mcp = FastMCP("ghidra-mcp")
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
 
-def safe_get(endpoint: str, params: dict = None) -> list:
+def safe_get(endpoint: str, params: dict = None, timeout: int = 5) -> list:
     """
     Perform a GET request with optional query parameters.
     """
@@ -33,7 +33,7 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     url = urljoin(ghidra_server_url, endpoint)
 
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.splitlines()
@@ -42,13 +42,13 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
-def safe_post(endpoint: str, data: dict | str) -> str:
+def safe_post(endpoint: str, data: dict | str, timeout: int = 5) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=timeout)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -72,11 +72,16 @@ def list_classes(offset: int = 0, limit: int = 100) -> list:
     return safe_get("classes", {"offset": offset, "limit": limit})
 
 @mcp.tool()
-def decompile_function(name: str) -> str:
+def decompile_function(name: str, timeout: int = 60) -> str:
     """
     Decompile a specific function by name and return the decompiled C code.
+
+    Args:
+        name: Function name to decompile
+        timeout: Max seconds Ghidra waits for decompilation (default 60). Raise it
+                 for large/complex functions that would otherwise time out.
     """
-    return safe_post("decompile", name)
+    return safe_post(f"decompile?timeout={timeout}", name, timeout=timeout + 10)
 
 @mcp.tool()
 def rename_function(old_name: str, new_name: str) -> str:
@@ -176,11 +181,16 @@ def list_functions() -> list:
     return safe_get("list_functions")
 
 @mcp.tool()
-def decompile_function_by_address(address: str) -> str:
+def decompile_function_by_address(address: str, timeout: int = 60) -> str:
     """
     Decompile a function at the given address.
+
+    Args:
+        address: Address within the function in hex format (e.g. "0x1400010a0")
+        timeout: Max seconds Ghidra waits for decompilation (default 60). Raise it
+                 for large/complex functions that would otherwise time out.
     """
-    return "\n".join(safe_get("decompile_function", {"address": address}))
+    return "\n".join(safe_get("decompile_function", {"address": address, "timeout": timeout}, timeout=timeout + 10))
 
 @mcp.tool()
 def disassemble_function(address: str) -> list:
@@ -286,6 +296,37 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
     if filter:
         params["filter"] = filter
     return safe_get("strings", params)
+
+@mcp.tool()
+def read_bytes(address: str, length: int = 16) -> str:
+    """
+    Read raw bytes at an address and return them as a hex dump.
+
+    Args:
+        address: Start address in hex format (e.g. "0x1400010a0")
+        length: Number of bytes to read (default 16, max 4096)
+
+    Returns:
+        A line like "<address>: aa bb cc ..." with the raw bytes in hex
+    """
+    return "\n".join(safe_get("read_bytes", {"address": address, "length": length}))
+
+@mcp.tool()
+def search_bytes(pattern: str, limit: int = 100) -> list:
+    """
+    Search program memory for a hex byte pattern and return matching addresses.
+
+    Args:
+        pattern: Hex bytes to search for. Spaces are ignored and "??" is a
+                 single-byte wildcard, e.g. "fd 43 03 00" or "8b ?? 24".
+        limit: Maximum number of matches to return (default 100)
+
+    Returns:
+        List of addresses where the pattern was found
+    """
+    if not pattern:
+        return ["Error: pattern (hex bytes) is required"]
+    return safe_get("search_bytes", {"pattern": pattern, "limit": limit})
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")

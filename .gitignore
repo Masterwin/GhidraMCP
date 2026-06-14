@@ -52,6 +52,13 @@ replay_pid*
 # Third party JAR files from Ghidra
 lib/*.jar
 
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Built Ghidra extension artifact (rebuildable from source)
+/GhidraMCP-*.zip
+
 
 # Axon Terminal checkpoints
 .jkt-checkpoints/

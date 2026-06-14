@@ -6,6 +6,8 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.GlobalNamespace;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.*;
 import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.program.model.symbol.Reference;
@@ -123,7 +125,8 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/decompile", exchange -> {
             String name = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-            sendResponse(exchange, decompileFunctionByName(name));
+            int timeout = parseIntOrDefault(parseQueryParams(exchange).get("timeout"), 60);
+            sendResponse(exchange, decompileFunctionByName(name, timeout));
         });
 
         server.createContext("/renameFunction", exchange -> {
@@ -214,7 +217,8 @@ public class GhidraMCPPlugin extends Plugin {
         server.createContext("/decompile_function", exchange -> {
             Map<String, String> qparams = parseQueryParams(exchange);
             String address = qparams.get("address");
-            sendResponse(exchange, decompileFunctionByAddress(address));
+            int timeout = parseIntOrDefault(qparams.get("timeout"), 60);
+            sendResponse(exchange, decompileFunctionByAddress(address, timeout));
         });
 
         server.createContext("/disassemble_function", exchange -> {
@@ -339,6 +343,20 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        server.createContext("/read_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            int length = parseIntOrDefault(qparams.get("length"), 16);
+            sendResponse(exchange, readBytes(address, length));
+        });
+
+        server.createContext("/search_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String pattern = qparams.get("pattern");
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchBytes(pattern, limit));
         });
 
         server.setExecutor(null);
@@ -490,7 +508,7 @@ public class GhidraMCPPlugin extends Plugin {
     // Logic for rename, decompile, etc.
     // ----------------------------------------------------------------------------------
 
-    private String decompileFunctionByName(String name) {
+    private String decompileFunctionByName(String name, int timeoutSecs) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
         DecompInterface decomp = new DecompInterface();
@@ -498,7 +516,7 @@ public class GhidraMCPPlugin extends Plugin {
         for (Function func : program.getFunctionManager().getFunctions(true)) {
             if (func.getName().equals(name)) {
                 DecompileResults result =
-                    decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+                    decomp.decompileFunction(func, timeoutSecs, new ConsoleTaskMonitor());
                 if (result != null && result.decompileCompleted()) {
                     return result.getDecompiledFunction().getC();
                 } else {
@@ -797,7 +815,7 @@ public class GhidraMCPPlugin extends Plugin {
     /**
      * Decompile a function at the given address
      */
-    private String decompileFunctionByAddress(String addressStr) {
+    private String decompileFunctionByAddress(String addressStr, int timeoutSecs) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
         if (addressStr == null || addressStr.isEmpty()) return "Address is required";
@@ -809,7 +827,7 @@ public class GhidraMCPPlugin extends Plugin {
 
             DecompInterface decomp = new DecompInterface();
             decomp.openProgram(program);
-            DecompileResults result = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+            DecompileResults result = decomp.decompileFunction(func, timeoutSecs, new ConsoleTaskMonitor());
 
             return (result != null && result.decompileCompleted()) 
                 ? result.getDecompiledFunction().getC() 
@@ -1645,6 +1663,82 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * Read raw bytes starting at an address and return them as a hex dump.
+     */
+    private String readBytes(String addressStr, int length) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (length <= 0) return "Length must be positive";
+        if (length > 4096) length = 4096; // safety cap on a single read
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            byte[] buffer = new byte[length];
+            int read = program.getMemory().getBytes(addr, buffer);
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(addr.toString()).append(": ");
+            for (int i = 0; i < read; i++) {
+                sb.append(String.format("%02x ", buffer[i] & 0xFF));
+            }
+            return sb.toString().trim();
+        } catch (MemoryAccessException e) {
+            return "Memory access error: " + e.getMessage();
+        } catch (Exception e) {
+            return "Error reading bytes: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Search memory for a hex byte pattern. Spaces are ignored and "??" acts as a
+     * wildcard for a single byte (e.g. "fd 43 ?? 03"). Returns matching addresses.
+     */
+    private String searchBytes(String pattern, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (pattern == null || pattern.isEmpty()) return "Pattern (hex bytes) is required";
+
+        String clean = pattern.replaceAll("\\s+", "");
+        if (clean.length() % 2 != 0) return "Hex pattern must have an even number of nibbles";
+
+        int n = clean.length() / 2;
+        byte[] bytes = new byte[n];
+        byte[] masks = new byte[n];
+        try {
+            for (int i = 0; i < n; i++) {
+                String b = clean.substring(i * 2, i * 2 + 2);
+                if (b.equals("??")) {
+                    bytes[i] = 0;
+                    masks[i] = 0;
+                } else {
+                    bytes[i] = (byte) Integer.parseInt(b, 16);
+                    masks[i] = (byte) 0xFF;
+                }
+            }
+        } catch (NumberFormatException e) {
+            return "Invalid hex pattern: " + e.getMessage();
+        }
+
+        Memory mem = program.getMemory();
+        TaskMonitor monitor = new ConsoleTaskMonitor();
+        List<String> results = new ArrayList<>();
+        Address start = mem.getMinAddress();
+        while (results.size() < limit && start != null) {
+            Address found = mem.findBytes(start, bytes, masks, true, monitor);
+            if (found == null) break;
+            results.add(found.toString());
+            try {
+                start = found.add(1);
+            } catch (Exception e) {
+                break;
+            }
+        }
+        if (results.isEmpty()) return "No matches found";
+        return String.join("\n", results);
     }
 
     public Program getCurrentProgram() {

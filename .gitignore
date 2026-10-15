@@ -58,7 +58,3 @@ __pycache__/
 
 # Built Ghidra extension artifact (rebuildable from source)
 /GhidraMCP-*.zip
-
-
-# Axon Terminal checkpoints
-.jkt-checkpoints/
